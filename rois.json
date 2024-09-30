@@ -1,0 +1,12 @@
+[
+    {"type": "rect", "coords": [1005, 611, 141, 99]},
+    {"type": "rect", "coords": [847, 373, 221, 209]},
+    {"type": "circle", "coords": {"center_x": 723, "center_y": 89, "radius": 74}},
+    {"type": "circle", "coords": {"center_x": 574, "center_y": 87, "radius": 71}},
+    {"type": "rect", "coords": [87, 20, 178, 165]},
+    {"type": "circle", "coords": {"center_x": 547, "center_y": 489, "radius": 81}},
+    {"type": "circle", "coords": {"center_x": 402, "center_y": 490, "radius": 72}},
+    {"type": "circle", "coords": {"center_x": 590, "center_y": 699, "radius": 61}},
+    {"type": "rect", "coords": [380, 646, 152, 115]},
+    {"type": "rect", "coords": [237, 679, 150, 82]}
+  ]
