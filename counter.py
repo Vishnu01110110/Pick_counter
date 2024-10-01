@@ -3,13 +3,9 @@ import numpy as np
 import rosbag
 from cv_bridge import CvBridge
 import json
-from ultralytics import YOLO
 
 # Initialize the CvBridge
 bridge = CvBridge()
-
-# Load YOLOv10 model (using the Nano model for performance)
-model = YOLO('yolov10n.pt')
 
 # Function to draw ROIs on an image
 def draw_rois(image, rois):
@@ -36,151 +32,119 @@ def draw_rois(image, rois):
 with open('rois.json', 'r') as f:
     rois = json.load(f)
 
-# Initialize counters and trackers
+# Initialize counters and states
 roi_counters = [0 for _ in rois]  # A counter for each ROI
-person_trackers = {}
-person_id_counter = 0
+roi_states = ['empty' for _ in rois]  # State per ROI
+roi_buffers = [0 for _ in rois]  # Buffer frames per ROI
 
 # Parameters
-buffer_frames = 5  # Number of frames to buffer before counting again
+buffer_frames = 3  # Number of frames to buffer before counting again
+hand_area_threshold = (500, 5000)  # Min and max area for hand detection
+object_area_threshold = (10, 5000)  # Min and max area for object detection
+
+# Initialize background subtractor
+bg_subtractor_hand = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=25, detectShadows=False)
+bg_subtractor_object = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
 
 # Helper functions
-def detect_persons(image):
-    results = model.predict(image)
-    persons = []
-
-    for result in results:
-        boxes = result.boxes
-        for box in boxes:
-            cls = int(box.cls[0])
-            conf = float(box.conf[0])
-            if cls == 0 and conf > 0.5:  # Class 0 is 'person'
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                w = x2 - x1
-                h = y2 - y1
-                persons.append((x1, y1, w, h, conf))
-    return persons
-
-def initialize_person_trackers(persons):
-    global person_id_counter
-    # Sort persons by area (largest to smallest) to select the most prominent ones
-    persons = sorted(persons, key=lambda p: p[2] * p[3], reverse=True)
-    # Take the first 3 persons
-    selected_persons = persons[:3]
-    for (x, y, w, h, conf) in selected_persons:
-        person_trackers[person_id_counter] = {
-            'id': person_id_counter,
-            'bbox': (x, y, w, h),
-            'buffer': 0,
-            'counted': False
-        }
-        person_id_counter += 1
-
-def update_person_trackers(persons):
-    new_trackers = {}
-    for pid, pdata in person_trackers.items():
-        # Try to match existing tracker with detected persons
-        best_match = None
-        best_distance = float('inf')
-        for (x, y, w, h, conf) in persons:
-            person_center = (x + w // 2, y + h // 2)
-            tracker_center = (pdata['bbox'][0] + pdata['bbox'][2] // 2,
-                              pdata['bbox'][1] + pdata['bbox'][3] // 2)
-            distance = np.linalg.norm(np.array(person_center) - np.array(tracker_center))
-            if distance < best_distance:
-                best_distance = distance
-                best_match = (x, y, w, h)
-
-        if best_match and best_distance < 50:
-            # Update tracker
-            pdata['bbox'] = best_match[:4]
-            new_trackers[pid] = pdata
-        else:
-            # Tracker lost; keep the last known position
-            new_trackers[pid] = pdata
-
-    return new_trackers
-
-def update_counts_and_states():
-    for idx, roi in enumerate(rois):
-        roi_type = roi['type']
-        roi_coords = roi['coords']
-
-        # Get ROI bounding box
-        if roi_type == 'rect':
-            roi_bbox = (roi_coords[0], roi_coords[1], roi_coords[0] + roi_coords[2], roi_coords[1] + roi_coords[3])
-        elif roi_type == 'circle':
-            # For circle, approximate with bounding box
-            cx, cy = roi_coords['center_x'], roi_coords['center_y']
-            r = roi_coords['radius']
-            roi_bbox = (cx - r, cy - r, cx + r, cy + r)
-        else:
-            continue  # Unsupported ROI type
-
-        # Update person trackers
-        for pid, pdata in person_trackers.items():
-            x, y, w, h = pdata['bbox']
-            person_bbox = (x, y, x + w, y + h)
-
-            # Check if person bbox intersects with ROI bbox
-            intersection_area = compute_intersection_area(person_bbox, roi_bbox)
-            if intersection_area > 0:
-                if not pdata['counted']:
-                    roi_counters[idx] += 1
-                    pdata['counted'] = True
-                    pdata['buffer'] = buffer_frames
-                    print(f"Person {pid} counted in ROI {idx}")
-            else:
-                if pdata['buffer'] > 0:
-                    pdata['buffer'] -= 1
-                else:
-                    pdata['counted'] = False  # Reset counted status when outside ROI
-
-def compute_intersection_area(boxA, boxB):
-    # boxA and boxB are (x1, y1, x2, y2)
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-    interWidth = max(0, xB - xA)
-    interHeight = max(0, yB - yA)
-    return interWidth * interHeight
+def is_contour_in_roi(contour, roi):
+    x, y, w, h = cv2.boundingRect(contour)
+    contour_center = (x + w // 2, y + h // 2)
+    roi_type = roi['type']
+    roi_coords = roi['coords']
+    if roi_type == 'rect':
+        x_roi, y_roi, w_roi, h_roi = roi_coords
+        return (x_roi <= contour_center[0] <= x_roi + w_roi) and (y_roi <= contour_center[1] <= y_roi + h_roi)
+    elif roi_type == 'circle':
+        cx, cy = roi_coords['center_x'], roi_coords['center_y']
+        r = roi_coords['radius']
+        return (contour_center[0] - cx) ** 2 + (contour_center[1] - cy) ** 2 <= r ** 2
+    else:
+        return False
 
 # Read images from the rosbag file and process them in real-time
 bag_file = '9_26_0930am.bag'
 bag = rosbag.Bag(bag_file)
 
-# Initialize person trackers in the first few frames
-initial_frames = 5
-frame_count = 0
-
 # Process each image frame-by-frame
 for topic, msg, t in bag.read_messages(topics=['/arena_camera_node_0/image_raw']):
     cv_image = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-    frame_count += 1
 
-    # Detect persons using YOLOv10
-    persons = detect_persons(cv_image)
+    # Apply background subtraction to detect hands/motion
+    gray_frame = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+    fg_mask_hand = bg_subtractor_hand.apply(gray_frame)
+    # Threshold and clean up the mask
+    _, fg_mask_hand = cv2.threshold(fg_mask_hand, 127, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    fg_mask_hand = cv2.morphologyEx(fg_mask_hand, cv2.MORPH_OPEN, kernel)
 
-    if frame_count <= initial_frames:
-        # Initialize person trackers in the initial frames
-        initialize_person_trackers(persons)
-    else:
-        # Update person trackers
-        person_trackers = update_person_trackers(persons)
+    # Find contours (possible hands)
+    contours_hand, _ = cv2.findContours(fg_mask_hand, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Update counts and states for persons
-    update_counts_and_states()
+    # Apply background subtraction to detect objects
+    fg_mask_object = bg_subtractor_object.apply(gray_frame)
+    # Threshold and clean up the mask
+    _, fg_mask_object = cv2.threshold(fg_mask_object, 127, 255, cv2.THRESH_BINARY)
+    fg_mask_object = cv2.morphologyEx(fg_mask_object, cv2.MORPH_OPEN, kernel)
+
+    # Find contours (possible objects)
+    contours_object, _ = cv2.findContours(fg_mask_object, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     # Draw ROIs on the image
     image_with_rois = draw_rois(cv_image.copy(), rois)
 
-    # Draw detected persons with IDs
-    for pid, pdata in person_trackers.items():
-        x, y, w, h = pdata['bbox']
-        cv2.rectangle(image_with_rois, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        cv2.putText(image_with_rois, f"Person {pid}", (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+    # Process each ROI
+    for idx, roi in enumerate(rois):
+        # Decrease buffer if needed
+        if roi_buffers[idx] > 0:
+            roi_buffers[idx] -= 1
+
+        # Initialize flags
+        hand_in_roi = False
+        object_in_roi = False
+
+        # Check for hands in ROI
+        for contour in contours_hand:
+            area = cv2.contourArea(contour)
+            if hand_area_threshold[0] < area < hand_area_threshold[1]:
+                if is_contour_in_roi(contour, roi):
+                    hand_in_roi = True
+                    # Draw the contour
+                    cv2.drawContours(image_with_rois, [contour], -1, (255, 0, 0), 2)
+                    break  # We can stop after finding one hand
+
+        # Check for objects in ROI
+        for contour in contours_object:
+            area = cv2.contourArea(contour)
+            if object_area_threshold[0] < area < object_area_threshold[1]:
+                if is_contour_in_roi(contour, roi):
+                    object_in_roi = True
+                    # Draw the contour
+                    cv2.drawContours(image_with_rois, [contour], -1, (0, 255, 255), 2)
+                    break  # We can stop after finding one object
+
+        # Update state and counting logic
+        if roi_states[idx] == 'empty':
+            if hand_in_roi:
+                roi_states[idx] = 'hand_in'
+            elif object_in_roi:
+                roi_states[idx] = 'object_in'
+                # Count immediately when object enters
+                if roi_buffers[idx] == 0:
+                    roi_counters[idx] += 1
+                    roi_buffers[idx] = buffer_frames
+                    print(f"Object entered ROI {idx}, count: {roi_counters[idx]}")
+        elif roi_states[idx] == 'hand_in':
+            if not hand_in_roi:
+                # Hand left the ROI
+                if roi_buffers[idx] == 0:
+                    roi_counters[idx] += 1
+                    roi_buffers[idx] = buffer_frames
+                    print(f"Hand action in ROI {idx}, count: {roi_counters[idx]}")
+                roi_states[idx] = 'empty'
+        elif roi_states[idx] == 'object_in':
+            if not object_in_roi:
+                roi_states[idx] = 'empty'
 
     # Display the counters on the image
     for idx, count in enumerate(roi_counters):
@@ -199,7 +163,7 @@ for topic, msg, t in bag.read_messages(topics=['/arena_camera_node_0/image_raw']
         cv2.putText(image_with_rois, f"Count: {count}", position,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-    # Show the image with ROIs, detected persons, and counts
+    # Show the image with ROIs, detected hands, objects, and counts
     cv2.imshow("Video with ROIs and Detections", image_with_rois)
     if cv2.waitKey(1) & 0xFF == 27:  # Press 'Esc' to exit
         break
